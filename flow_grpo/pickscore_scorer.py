@@ -2,11 +2,23 @@ from transformers import CLIPProcessor, CLIPModel
 from PIL import Image
 import torch
 
+# 保存原有的 torch.empty
+_old_empty = torch.empty
+
+# 定义一个新函数：如果没传 size 或者 size 为空，自动补上 ()
+def _safe_empty(*args, **kwargs):
+    if not args or len(args) == 0:
+        return _old_empty((), **kwargs)
+    return _old_empty(*args, **kwargs)
+
+# 狸猫换太子，替换掉原生的 torch.empty
+torch.empty = _safe_empty
+
 class PickScoreScorer(torch.nn.Module):
     def __init__(self, device="cuda", dtype=torch.float32):
         super().__init__()
-        processor_path = "laion/CLIP-ViT-H-14-laion2B-s32B-b79K"
-        model_path = "yuvalkirstain/PickScore_v1"
+        processor_path = "/data/chengwenxuan/reward_model/clip-vit-h-14"
+        model_path = "/data/chengwenxuan/reward_model/PickScore_v1"
         self.device = device
         self.dtype = dtype
         self.processor = CLIPProcessor.from_pretrained(processor_path)

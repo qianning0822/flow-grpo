@@ -212,11 +212,12 @@ def compute_log_prob(transformer, pipeline, sample, j, embeds, pooled_embeds, co
         noise_level=config.sample.noise_level,
         return_sqrt_dt=config.rationorm
     )
-    if config.rationorm:
+    if config.rationorm:#比率归一化，对loss按sqrt_dt进行归一化，prev_sample_mean是为了计算比率归一化的分母
         return prev_sample, log_prob, prev_sample_mean, std_dev_t, sqrt_dt
     return prev_sample, log_prob, prev_sample_mean, std_dev_t
 
-def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, reward_fn, executor, autocast, num_train_timesteps, ema, transformer_trainable_parameters):
+def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, reward_fn, 
+         executor, autocast, num_train_timesteps, ema, transformer_trainable_parameters):
     if config.train.ema:
         ema.copy_ema_to(transformer_trainable_parameters, store_temp=True)
     neg_prompt_embed, neg_pooled_prompt_embed = compute_text_embeddings([""], text_encoders, tokenizers, max_sequence_length=128, device=accelerator.device)
@@ -246,7 +247,7 @@ def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerat
             sample_neg_pooled_prompt_embeds = sample_neg_pooled_prompt_embeds[:len(prompt_embeds)]
         with autocast():
             with torch.no_grad():
-                images, _, _ = pipeline_with_logprob(
+                images, _, _ = pipeline_with_logprob(#处理从T到0整个序列返回整个序列的log_prob和prev_sample_mean，虽然eval阶段不需要log_prob和prev_sample_mean，但为了代码简洁复用了pipeline_with_logprob函数
                     pipeline,
                     prompt_embeds=prompt_embeds,
                     pooled_prompt_embeds=pooled_prompt_embeds,
@@ -283,7 +284,6 @@ def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerat
     last_batch_rewards_gather = {}
     for key, value in rewards.items():
         last_batch_rewards_gather[key] = accelerator.gather(torch.as_tensor(value, device=accelerator.device)).cpu().numpy()
-
     all_rewards = {key: np.concatenate(value) for key, value in all_rewards.items()}
     if accelerator.is_main_process:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -409,7 +409,7 @@ def main(_):
         inference_dtype = torch.bfloat16
 
     # Move vae and text_encoder to device and cast to inference_dtype
-    pipeline.vae.to(accelerator.device, dtype=torch.float32)
+    pipeline.vae.to(accelerator.device, dtype=torch.float16)
     pipeline.text_encoder.to(accelerator.device, dtype=inference_dtype)
     pipeline.text_encoder_2.to(accelerator.device, dtype=inference_dtype)
     pipeline.text_encoder_3.to(accelerator.device, dtype=inference_dtype)

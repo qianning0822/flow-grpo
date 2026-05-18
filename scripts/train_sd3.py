@@ -39,6 +39,47 @@ config_flags.DEFINE_config_file("config", "config/base.py", "Training configurat
 
 logger = get_logger(__name__)
 
+import functools
+from accelerate import Accelerator, FullyShardedDataParallelPlugin
+
+# 1. 显式导入这三个核心层类
+from diffusers.models.transformers.transformer_sd3 import JointTransformerBlock
+from transformers.models.clip.modeling_clip import CLIPEncoderLayer
+from transformers.models.t5.modeling_t5 import T5Block
+
+# 2. 定义需要被 FSDP 切分的层类集合
+# 这种策略下，FSDP 扫描到一个模型时，有这个类就切分，没有就跳过，绝对不会报 ValueError
+def custom_auto_wrap_policy(module, recurse, nonwrapped_numel=0, **kwargs):
+    # 策略 A：如果是主模型 Transformer，只切分 JointTransformerBlock（保护了 pos_embed 卷积层）
+    if module.__class__ == JointTransformerBlock:
+        return True
+        
+    # 策略 B：如果是文本编码器 1 和 2（CLIP），按照它的行/层进行切分
+    if module.__class__ == CLIPEncoderLayer:
+        return True
+        
+    # 策略 C：如果是大语言模型文本编码器 3（T5 XXL），按照它的 T5Block 进行切分
+    if module.__class__ == T5Block:
+        return True
+        
+    # 其他零散的边缘层（如各种 projection、embeddings、norm）一律不单独切分，保持完整
+    return False
+
+# 3. 初始化 FSDP 插件并绑定 Python 策略函数
+fsdp_plugin = FullyShardedDataParallelPlugin(
+    auto_wrap_policy=custom_auto_wrap_policy
+)
+
+# 4. 将 fsdp_plugin 传入 Accelerator
+# 保持你原有的项目配置（如 project_config=... 等）
+accelerator = Accelerator(
+    fsdp_plugin=fsdp_plugin
+    # 你的其他参数，例如:
+    # gradient_accumulation_steps=config.train.gradient_accumulation_steps,
+    # log_with="wandb",
+    # project_config=project_config
+)
+
 class TextPromptDataset(Dataset):
     def __init__(self, dataset, split='train'):
         self.file_path = os.path.join(dataset, f'{split}.txt')
@@ -408,10 +449,13 @@ def main(_):
 
     # Move vae and text_encoder to device and cast to inference_dtype
     pipeline.vae.to(accelerator.device, dtype=torch.float32)
-    pipeline.text_encoder.to(accelerator.device, dtype=inference_dtype)
-    pipeline.text_encoder_2.to(accelerator.device, dtype=inference_dtype)
-    pipeline.text_encoder_3.to(accelerator.device, dtype=inference_dtype)
-    
+    pipeline.text_encoder.to(dtype=inference_dtype)
+    pipeline.text_encoder_2.to(dtype=inference_dtype)
+    pipeline.text_encoder_3.to(dtype=inference_dtype)
+
+    # 打包成列表，供后面循环使用
+    text_encoders = [pipeline.text_encoder, pipeline.text_encoder_2, pipeline.text_encoder_3]
+
     pipeline.transformer.to(accelerator.device)
 
     if config.use_lora:
@@ -503,7 +547,7 @@ def main(_):
             batch_size=config.sample.test_batch_size,
             collate_fn=TextPromptDataset.collate_fn,
             shuffle=False,
-            num_workers=8,
+            num_workers=0,
         )
     
     elif config.prompt_fn == "geneval":
@@ -555,8 +599,43 @@ def main(_):
     autocast = contextlib.nullcontext if config.use_lora else accelerator.autocast
     # autocast = accelerator.autocast
 
+    if accelerator.state.deepspeed_plugin is not None:
+            # 显式告诉 DeepSpeed 每张 GPU 的微批次大小是多少
+            accelerator.state.deepspeed_plugin.deepspeed_config['train_micro_batch_size_per_gpu'] = config.sample.train_batch_size
+
+    
+
     # Prepare everything with our `accelerator`.
-    transformer, optimizer, train_dataloader, test_dataloader = accelerator.prepare(transformer, optimizer, train_dataloader, test_dataloader)
+    # 现在可以安全地把它们都放入 prepare，显存将被完美切分和释放
+    (
+        transformer, 
+        pipeline.text_encoder, 
+        pipeline.text_encoder_2, 
+        pipeline.text_encoder_3, 
+        optimizer, 
+        train_dataloader, 
+        test_dataloader
+    ) = accelerator.prepare(
+        transformer, 
+        pipeline.text_encoder, 
+        pipeline.text_encoder_2, 
+        pipeline.text_encoder_3, 
+        optimizer, 
+        train_dataloader, 
+        test_dataloader
+    )
+
+    text_encoders = [pipeline.text_encoder, pipeline.text_encoder_2, pipeline.text_encoder_3]
+
+    transformer_trainable_parameters = list(filter(lambda p: p.requires_grad, transformer.parameters()))
+
+    # 5. 💡 此时再初始化 EMA！它克隆到的就是完美匹配 FSDP 的切碎形状
+    ema = EMAModuleWrapper(
+        transformer_trainable_parameters, 
+        decay=0.9, 
+        update_step_interval=8, 
+        device=accelerator.device
+    )
 
     # executor to perform callbacks asynchronously. this is beneficial for the llava callbacks which makes a request to a
     # remote server running llava inference.

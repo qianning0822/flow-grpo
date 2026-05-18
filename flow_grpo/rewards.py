@@ -80,7 +80,7 @@ def image_similarity_score(device):
 def pickscore_score(device):
     from flow_grpo.pickscore_scorer import PickScoreScorer
 
-    scorer = PickScoreScorer(dtype=torch.float32, device=device)
+    scorer = PickScoreScorer(dtype=torch.float16, device=device)
 
     def _fn(images, prompts, metadata):
         if isinstance(images, torch.Tensor):
