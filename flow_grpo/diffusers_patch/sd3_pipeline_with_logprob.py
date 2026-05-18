@@ -35,7 +35,9 @@ def pipeline_with_logprob(
     max_sequence_length: int = 256,
     skip_layer_guidance_scale: float = 2.8,
     noise_level: float = 0.7,
-    return_prev_sample_mean: bool = False
+    return_prev_sample_mean: bool = False,
+    # reduce memory: 采样 CFG 可拆成 uncond/text 两次前向，避免一次性构造双倍 batch。
+    sequential_guidance: bool = False,
 ):
     height = height or self.default_sample_size * self.vae_scale_factor
     width = width or self.default_sample_size * self.vae_scale_factor
@@ -100,7 +102,7 @@ def pipeline_with_logprob(
         max_sequence_length=max_sequence_length,
         lora_scale=lora_scale,
     )
-    if self.do_classifier_free_guidance:
+    if self.do_classifier_free_guidance and not sequential_guidance:
         prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
         pooled_prompt_embeds = torch.cat([negative_pooled_prompt_embeds, pooled_prompt_embeds], dim=0)
 
@@ -140,21 +142,42 @@ def pipeline_with_logprob(
             if self.interrupt:
                 continue
 
-            # expand the latents if we are doing classifier free guidance
-            latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
-            # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
-            timestep = t.expand(latent_model_input.shape[0])
-            noise_pred = self.transformer(
-                hidden_states=latent_model_input,
-                timestep=timestep,
-                encoder_hidden_states=prompt_embeds,
-                pooled_projections=pooled_prompt_embeds,
-                joint_attention_kwargs=self.joint_attention_kwargs,
-                return_dict=False,
-            )[0]
+            if self.do_classifier_free_guidance and sequential_guidance:
+                # reduce memory: sequential CFG 下不拼接 latent/prompt，分别跑 uncond 和 text 前向。
+                timestep = t.expand(latents.shape[0])
+                noise_pred_uncond = self.transformer(
+                    hidden_states=latents,
+                    timestep=timestep,
+                    encoder_hidden_states=negative_prompt_embeds,
+                    pooled_projections=negative_pooled_prompt_embeds,
+                    joint_attention_kwargs=self.joint_attention_kwargs,
+                    return_dict=False,
+                )[0]
+                noise_pred_text = self.transformer(
+                    hidden_states=latents,
+                    timestep=timestep,
+                    encoder_hidden_states=prompt_embeds,
+                    pooled_projections=pooled_prompt_embeds,
+                    joint_attention_kwargs=self.joint_attention_kwargs,
+                    return_dict=False,
+                )[0]
+                noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
+            else:
+                # expand the latents if we are doing classifier free guidance
+                latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
+                # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
+                timestep = t.expand(latent_model_input.shape[0])
+                noise_pred = self.transformer(
+                    hidden_states=latent_model_input,
+                    timestep=timestep,
+                    encoder_hidden_states=prompt_embeds,
+                    pooled_projections=pooled_prompt_embeds,
+                    joint_attention_kwargs=self.joint_attention_kwargs,
+                    return_dict=False,
+                )[0]
             # noise_pred = noise_pred.to(prompt_embeds.dtype)
             # perform guidance
-            if self.do_classifier_free_guidance:
+            if self.do_classifier_free_guidance and not sequential_guidance:
                 noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                 noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
                 

@@ -28,8 +28,13 @@ def get_config():
     config.use_lora = True
     config.dataset = ""
     config.resolution = 768
-    config.activation_checkpointing = False
-    config.fsdp_optimizer_offload = False
+    config.activation_checkpointing = True
+    config.fsdp_optimizer_offload = True
+    # reduce memory: 默认关闭显存优化开关，由具体训练配置按需开启。
+    config.fsdp2 = True
+    config.fsdp2_shard_text_encoders = True
+    config.fsdp2_cpu_offload = True
+    config.sample_cpu_offload = True
 
     ###### Pretrained Model ######
     config.pretrained = pretrained = ml_collections.ConfigDict()
@@ -61,6 +66,8 @@ def get_config():
     sample.noise_level = 0.7
     # Whether to use the same noise for the same prompt
     sample.same_latent = False
+    # reduce memory: 默认不拆分采样 CFG，显存紧张的配置可改为逐次前向。
+    sample.cfg_sequential = False
     # sde window size
     sample.sde_window_size = 2
     # sde window range
@@ -93,6 +100,8 @@ def get_config():
     # whether or not to use classifier-free guidance during training. if enabled, the same guidance scale used during
     # sampling will be used during training.
     train.cfg = True
+    # reduce memory: 默认不拆分训练 CFG，显存紧张的配置可避免临时双倍 batch。
+    train.cfg_sequential = False
     # clip advantages to the range [-adv_clip_max, adv_clip_max].
     train.adv_clip_max = 5
     # the PPO clip range.

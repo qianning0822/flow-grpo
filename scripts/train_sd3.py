@@ -1,6 +1,20 @@
 from collections import defaultdict
 import contextlib
 import os
+
+
+# reduce memory: 在导入 torch 前开启可扩展 CUDA 段，降低 allocator 碎片造成的显存峰值。
+def _ensure_cuda_alloc_conf(option):
+    current = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+    key = option.split(":", 1)[0]
+    entries = [entry.strip() for entry in current.split(",") if entry.strip()]
+    entries = [entry for entry in entries if entry.split(":", 1)[0] != key]
+    entries.append(option)
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = ",".join(entries)
+
+
+_ensure_cuda_alloc_conf("expandable_segments:True")
+
 import datetime
 from concurrent import futures
 import time
@@ -21,15 +35,26 @@ from flow_grpo.diffusers_patch.sd3_pipeline_with_logprob import pipeline_with_lo
 from flow_grpo.diffusers_patch.sd3_sde_with_logprob import sde_step_with_logprob
 from flow_grpo.diffusers_patch.train_dreambooth_lora_sd3 import encode_prompt
 import torch
+import torch.distributed as dist
 import wandb
 from functools import partial
 import tqdm
 import tempfile
 from PIL import Image
-from peft import LoraConfig, get_peft_model, set_peft_model_state_dict, PeftModel
+from peft import LoraConfig, get_peft_model, get_peft_model_state_dict, set_peft_model_state_dict, PeftModel
 import random
 from torch.utils.data import Dataset, DataLoader, Sampler
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+    CheckpointImpl,
+    apply_activation_checkpointing,
+    checkpoint_wrapper,
+)
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy, OffloadPolicy, fully_shard
+from torch.distributed.fsdp._fully_shard import FSDPModule
+from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
 from flow_grpo.ema import EMAModuleWrapper
+from flow_grpo.fsdp_utils import register_optimizer_offload_hooks
 
 tqdm = partial(tqdm.tqdm, dynamic_ncols=True)
 
@@ -39,46 +64,238 @@ config_flags.DEFINE_config_file("config", "config/base.py", "Training configurat
 
 logger = get_logger(__name__)
 
-import functools
-from accelerate import Accelerator, FullyShardedDataParallelPlugin
-
-# 1. 显式导入这三个核心层类
 from diffusers.models.transformers.transformer_sd3 import JointTransformerBlock
 from transformers.models.clip.modeling_clip import CLIPEncoderLayer
 from transformers.models.t5.modeling_t5 import T5Block
 
-# 2. 定义需要被 FSDP 切分的层类集合
-# 这种策略下，FSDP 扫描到一个模型时，有这个类就切分，没有就跳过，绝对不会报 ValueError
-def custom_auto_wrap_policy(module, recurse, nonwrapped_numel=0, **kwargs):
-    # 策略 A：如果是主模型 Transformer，只切分 JointTransformerBlock（保护了 pos_embed 卷积层）
-    if module.__class__ == JointTransformerBlock:
-        return True
-        
-    # 策略 B：如果是文本编码器 1 和 2（CLIP），按照它的行/层进行切分
-    if module.__class__ == CLIPEncoderLayer:
-        return True
-        
-    # 策略 C：如果是大语言模型文本编码器 3（T5 XXL），按照它的 T5Block 进行切分
-    if module.__class__ == T5Block:
-        return True
-        
-    # 其他零散的边缘层（如各种 projection、embeddings、norm）一律不单独切分，保持完整
-    return False
+SD3_TRANSFORMER_LAYER_CLASSES = (JointTransformerBlock,)
+SD3_TEXT_ENCODER_LAYER_CLASSES = (CLIPEncoderLayer, T5Block)
 
-# 3. 初始化 FSDP 插件并绑定 Python 策略函数
-fsdp_plugin = FullyShardedDataParallelPlugin(
-    auto_wrap_policy=custom_auto_wrap_policy
-)
 
-# 4. 将 fsdp_plugin 传入 Accelerator
-# 保持你原有的项目配置（如 project_config=... 等）
-accelerator = Accelerator(
-    fsdp_plugin=fsdp_plugin
-    # 你的其他参数，例如:
-    # gradient_accumulation_steps=config.train.gradient_accumulation_steps,
-    # log_with="wandb",
-    # project_config=project_config
-)
+# reduce memory: FSDP2 只在多进程训练时启用，单卡保持原始路径避免额外开销。
+def should_use_fsdp2(config, accelerator):
+    if accelerator.num_processes <= 1:
+        return False
+    if hasattr(config, "fsdp2"):
+        return bool(config.fsdp2)
+    return True
+
+
+# reduce memory: 采样轨迹可常驻 CPU，训练当前 batch 前再搬回 GPU。
+def maybe_tensor_to_cpu(value, enabled):
+    if enabled and isinstance(value, torch.Tensor):
+        return value.detach().cpu()
+    return value
+
+
+# reduce memory: CPU 上的 replay buffer 在训练前按需搬到当前 GPU。
+def tensor_tree_to_device(value, device):
+    if isinstance(value, torch.Tensor):
+        return value.to(device, non_blocking=True)
+    if isinstance(value, dict):
+        return {key: tensor_tree_to_device(item, device) for key, item in value.items()}
+    return value
+
+
+# reduce memory: CPU replay buffer 使用 CPU mask/index，避免为了筛选整批搬回 GPU。
+def index_tensor(value, index):
+    if isinstance(value, torch.Tensor) and value.device.type == "cpu" and isinstance(index, torch.Tensor):
+        return value[index.cpu()]
+    return value[index]
+
+
+# reduce memory: 采样缓存搬到 CPU 后主动释放 PyTorch CUDA cache。
+def empty_cuda_cache_if_needed(enabled):
+    if enabled and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def materialize_dtensor_state_dict(state_dict):
+    materialized = {}
+    for key, value in state_dict.items():
+        if hasattr(value, "full_tensor"):
+            value = value.full_tensor()
+        if isinstance(value, torch.Tensor):
+            value = value.detach().cpu()
+        materialized[key] = value
+    return materialized
+
+
+# reduce memory: 按 transformer/text encoder block 做 FSDP2 切分，并可叠加 activation checkpointing。
+def apply_fsdp2_sharding(
+    module,
+    layer_classes,
+    mesh,
+    mp_policy,
+    offload_policy,
+    activation_checkpointing=False,
+):
+    modules_to_shard = [submodule for submodule in module.modules() if isinstance(submodule, layer_classes)]
+
+    if activation_checkpointing and modules_to_shard:
+        # reduce memory: 对大 block 启用重计算，用额外计算换取更低激活显存。
+        apply_activation_checkpointing(
+            module,
+            checkpoint_wrapper_fn=partial(
+                checkpoint_wrapper,
+                checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+            ),
+            check_fn=lambda submodule: isinstance(submodule, layer_classes),
+        )
+
+    for submodule in modules_to_shard:
+        fully_shard(
+            submodule,
+            mesh=mesh,
+            reshard_after_forward=True,
+            mp_policy=mp_policy,
+            offload_policy=offload_policy,
+        )
+
+    fully_shard(
+        module,
+        mesh=mesh,
+        reshard_after_forward=True,
+        mp_policy=mp_policy,
+        offload_policy=offload_policy,
+    )
+    return module
+
+
+def prepare_sd3_with_fsdp2(pipeline, config, accelerator, inference_dtype):
+    mesh = init_device_mesh(accelerator.device.type, (accelerator.num_processes,))
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=inference_dtype,
+        reduce_dtype=inference_dtype,
+        output_dtype=None,
+    )
+    offload_policy = (
+        # reduce memory: FSDP2 CPU offload 把空闲参数分片放到 CPU，降低 GPU 常驻参数显存。
+        CPUOffloadPolicy(pin_memory=True)
+        if bool(getattr(config, "fsdp2_cpu_offload", False))
+        else OffloadPolicy()
+    )
+
+    if bool(getattr(config, "fsdp2_shard_text_encoders", True)):
+        # reduce memory: 文本编码器同样按层切分，避免 T5/CLIP 在每张卡完整常驻。
+        pipeline.text_encoder = apply_fsdp2_sharding(
+            pipeline.text_encoder,
+            SD3_TEXT_ENCODER_LAYER_CLASSES,
+            mesh,
+            mp_policy,
+            offload_policy,
+            activation_checkpointing=False,
+        )
+        pipeline.text_encoder_2 = apply_fsdp2_sharding(
+            pipeline.text_encoder_2,
+            SD3_TEXT_ENCODER_LAYER_CLASSES,
+            mesh,
+            mp_policy,
+            offload_policy,
+            activation_checkpointing=False,
+        )
+        pipeline.text_encoder_3 = apply_fsdp2_sharding(
+            pipeline.text_encoder_3,
+            SD3_TEXT_ENCODER_LAYER_CLASSES,
+            mesh,
+            mp_policy,
+            offload_policy,
+            activation_checkpointing=False,
+        )
+    else:
+        pipeline.text_encoder.to(accelerator.device)
+        pipeline.text_encoder_2.to(accelerator.device)
+        pipeline.text_encoder_3.to(accelerator.device)
+
+    # reduce memory: SD3 transformer 主体按 JointTransformerBlock 切分，是主要显存节省来源。
+    pipeline.transformer = apply_fsdp2_sharding(
+        pipeline.transformer,
+        SD3_TRANSFORMER_LAYER_CLASSES,
+        mesh,
+        mp_policy,
+        offload_policy,
+        activation_checkpointing=bool(
+            getattr(
+                config,
+                "fsdp2_activation_checkpointing",
+                getattr(config, "activation_checkpointing", True),
+            )
+        ),
+    )
+
+    return pipeline.transformer
+
+
+def disable_adapter(transformer):
+    module = transformer.module if hasattr(transformer, "module") else transformer
+    if hasattr(module, "disable_adapter"):
+        return module.disable_adapter()
+    return contextlib.nullcontext()
+
+
+@contextlib.contextmanager
+def fsdp2_accumulate(accelerator, transformer, use_fsdp2):
+    with accelerator.accumulate(transformer):
+        if use_fsdp2:
+            # reduce memory: accumulation 内关闭不必要的梯度同步，减少 FSDP2 反传通信/缓冲峰值。
+            transformer.set_requires_gradient_sync(accelerator.sync_gradients)
+            transformer.set_is_last_backward(accelerator.sync_gradients)
+        try:
+            yield
+        finally:
+            if use_fsdp2:
+                transformer.set_requires_gradient_sync(True)
+                transformer.set_is_last_backward(True)
+
+
+def fsdp2_clip_grad_norm_(parameters, max_norm, norm_type=2.0):
+    parameters = [p for p in parameters if p.grad is not None]
+    if not parameters:
+        return torch.tensor(0.0)
+
+    device = parameters[0].grad.device
+    # reduce memory: CPU offload 下梯度可能在 CPU，规约标量临时放到 CUDA 以兼容 NCCL。
+    reduce_device = (
+        torch.device("cuda", torch.cuda.current_device())
+        if dist.is_available() and dist.is_initialized() and torch.cuda.is_available()
+        else device
+    )
+    if norm_type == float("inf"):
+        local_norm = torch.stack(
+            [
+                (p.grad.to_local() if hasattr(p.grad, "to_local") else p.grad)
+                .detach()
+                .abs()
+                .max()
+                .to(device)
+                for p in parameters
+            ]
+        ).max()
+        local_norm = local_norm.to(reduce_device)
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(local_norm, op=dist.ReduceOp.MAX)
+        total_norm = local_norm
+    else:
+        norm_type = float(norm_type)
+        local_norm = torch.zeros((), device=device, dtype=torch.float32)
+        for p in parameters:
+            grad = p.grad.to_local() if hasattr(p.grad, "to_local") else p.grad
+            local_norm += grad.detach().float().norm(norm_type).pow(norm_type)
+        local_norm = local_norm.to(reduce_device)
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(local_norm, op=dist.ReduceOp.SUM)
+        total_norm = local_norm.pow(1.0 / norm_type)
+
+    clip_coef = max_norm / (total_norm + 1e-6)
+    if clip_coef < 1:
+        clip_coef = clip_coef.item()
+        for p in parameters:
+            p.grad.mul_(clip_coef)
+    return total_norm
+
+
+def has_fsdp2_modules(model):
+    return any(isinstance(module, FSDPModule) for module in model.modules())
 
 class TextPromptDataset(Dataset):
     def __init__(self, dataset, split='train'):
@@ -219,16 +436,45 @@ def create_generator(prompts, base_seed):
     return generators
 
         
-def compute_log_prob(transformer, pipeline, sample, j, embeds, pooled_embeds, config):
+def compute_log_prob(
+    transformer,
+    pipeline,
+    sample,
+    j,
+    embeds,
+    pooled_embeds,
+    config,
+    negative_embeds=None,
+    negative_pooled_embeds=None,
+):
     if config.train.cfg:
-        noise_pred = transformer(
-            hidden_states=torch.cat([sample["latents"][:, j]] * 2),
-            timestep=torch.cat([sample["timesteps"][:, j]] * 2),
-            encoder_hidden_states=embeds,
-            pooled_projections=pooled_embeds,
-            return_dict=False,
-        )[0]
-        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+        if bool(getattr(config.train, "cfg_sequential", False)):
+            if negative_embeds is None or negative_pooled_embeds is None:
+                raise ValueError("Sequential CFG requires negative prompt embeddings.")
+            # reduce memory: 训练 CFG 拆成 uncond/text 两次前向，避免 hidden_states 临时拼成双 batch。
+            noise_pred_uncond = transformer(
+                hidden_states=sample["latents"][:, j],
+                timestep=sample["timesteps"][:, j],
+                encoder_hidden_states=negative_embeds,
+                pooled_projections=negative_pooled_embeds,
+                return_dict=False,
+            )[0]
+            noise_pred_text = transformer(
+                hidden_states=sample["latents"][:, j],
+                timestep=sample["timesteps"][:, j],
+                encoder_hidden_states=embeds,
+                pooled_projections=pooled_embeds,
+                return_dict=False,
+            )[0]
+        else:
+            noise_pred = transformer(
+                hidden_states=torch.cat([sample["latents"][:, j]] * 2),
+                timestep=torch.cat([sample["timesteps"][:, j]] * 2),
+                encoder_hidden_states=embeds,
+                pooled_projections=pooled_embeds,
+                return_dict=False,
+            )[0]
+            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
         noise_pred = (
             noise_pred_uncond
             + config.sample.guidance_scale
@@ -297,6 +543,10 @@ def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerat
                     height=config.resolution,
                     width=config.resolution, 
                     noise_level=0,
+                    # reduce memory: eval 采样同样复用 sequential CFG，避免测试阶段临时双倍 batch。
+                    sequential_guidance=bool(
+                        getattr(config.sample, "cfg_sequential", getattr(config.train, "cfg_sequential", False))
+                    ),
                 )
         rewards = executor.submit(reward_fn, images, prompts, prompt_metadata, only_strict=False)
         # yield to to make sure reward computation starts
@@ -365,16 +615,43 @@ def save_ckpt(save_dir, transformer, global_step, accelerator, ema, transformer_
     save_root = os.path.join(save_dir, "checkpoints", f"checkpoint-{global_step}")
     save_root_lora = os.path.join(save_root, "lora")
     os.makedirs(save_root_lora, exist_ok=True)
-    if accelerator.is_main_process:
-        if config.train.ema:
-            ema.copy_ema_to(transformer_trainable_parameters, store_temp=True)
-        unwrap_model(transformer, accelerator).save_pretrained(save_root_lora)
-        if config.train.ema:
-            ema.copy_temp_to(transformer_trainable_parameters)
+
+    if config.train.ema:
+        ema.copy_ema_to(transformer_trainable_parameters, store_temp=True)
+
+    unwrapped_transformer = unwrap_model(transformer, accelerator)
+    if has_fsdp2_modules(unwrapped_transformer):
+        if config.use_lora:
+            state_dict = get_peft_model_state_dict(unwrapped_transformer)
+            state_dict = materialize_dtensor_state_dict(state_dict)
+        else:
+            # reduce memory: 保存 FSDP2 全量权重时 offload 到 CPU，避免 rank0 GPU 聚合爆显存。
+            state_dict = get_model_state_dict(
+                unwrapped_transformer,
+                options=StateDictOptions(full_state_dict=True, cpu_offload=True),
+            )
+        if accelerator.is_main_process:
+            unwrapped_transformer.save_pretrained(save_root_lora, state_dict=state_dict)
+        del state_dict
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
+    elif accelerator.is_main_process:
+        unwrapped_transformer.save_pretrained(save_root_lora)
+
+    if config.train.ema:
+        ema.copy_temp_to(transformer_trainable_parameters)
 
 def main(_):
     # basic Accelerate and logging setup
     config = FLAGS.config
+    # reduce memory: 3090 不支持 bf16 时自动退到 fp16，保持半精度省显存路径可用。
+    bf16_fallback_to_fp16 = (
+        config.mixed_precision == "bf16"
+        and torch.cuda.is_available()
+        and not torch.cuda.is_bf16_supported()
+    )
+    if bf16_fallback_to_fp16:
+        config.mixed_precision = "fp16"
 
     unique_id = datetime.datetime.now().strftime("%Y.%m.%d_%H.%M.%S")
     if not config.run_name:
@@ -400,6 +677,11 @@ def main(_):
         # the total number of optimizer steps to accumulate across.
         gradient_accumulation_steps=config.train.gradient_accumulation_steps * num_train_timesteps,
     )
+    use_fsdp2 = should_use_fsdp2(config, accelerator)
+    if bf16_fallback_to_fp16:
+        accelerator.print("bf16 is not supported on this GPU; falling back to fp16.")
+    if accelerator.num_processes <= 1:
+        accelerator.print("FSDP2 requires --num_processes > 1; using the original single-process path.")
     if accelerator.is_main_process:
         wandb.init(
             project="flow_grpo",
@@ -453,11 +735,6 @@ def main(_):
     pipeline.text_encoder_2.to(dtype=inference_dtype)
     pipeline.text_encoder_3.to(dtype=inference_dtype)
 
-    # 打包成列表，供后面循环使用
-    text_encoders = [pipeline.text_encoder, pipeline.text_encoder_2, pipeline.text_encoder_3]
-
-    pipeline.transformer.to(accelerator.device)
-
     if config.use_lora:
         # Set correct lora layers
         target_modules = [
@@ -483,10 +760,20 @@ def main(_):
         else:
             pipeline.transformer = get_peft_model(pipeline.transformer, transformer_lora_config)
     
-    transformer = pipeline.transformer
+    if use_fsdp2:
+        # reduce memory: 多卡训练时在模型进入 optimizer 前完成 FSDP2 切分，降低每卡参数常驻显存。
+        transformer = prepare_sd3_with_fsdp2(pipeline, config, accelerator, inference_dtype)
+        accelerator.print("Using PyTorch FSDP2 for SD3 transformer and text encoders.")
+    else:
+        pipeline.transformer.to(accelerator.device)
+        transformer = pipeline.transformer
+
+    text_encoders = [pipeline.text_encoder, pipeline.text_encoder_2, pipeline.text_encoder_3]
     transformer_trainable_parameters = list(filter(lambda p: p.requires_grad, transformer.parameters()))
-    # This ema setting affects the previous 20 × 8 = 160 steps on average.
-    ema = EMAModuleWrapper(transformer_trainable_parameters, decay=0.9, update_step_interval=8, device=accelerator.device)
+    ema = None
+    if config.train.ema:
+        # This ema setting affects the previous 20 x 8 = 160 steps on average.
+        ema = EMAModuleWrapper(transformer_trainable_parameters, decay=0.9, update_step_interval=8, device=accelerator.device)
     
     # Enable TF32 for faster training on Ampere GPUs,
     # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
@@ -513,6 +800,9 @@ def main(_):
         weight_decay=config.train.adam_weight_decay,
         eps=config.train.adam_epsilon,
     )
+    if bool(getattr(config, "fsdp_optimizer_offload", False)):
+        # reduce memory: optimizer state 在 step 后卸载到 CPU，降低 Adam 状态常驻显存。
+        register_optimizer_offload_hooks(optimizer)
 
     # prepare prompt and reward fn
     reward_fn = getattr(flow_grpo.rewards, 'multi_score')(accelerator.device, config.reward_fn)
@@ -580,14 +870,6 @@ def main(_):
     else:
         raise NotImplementedError("Only general_ocr is supported with dataset")
 
-
-    neg_prompt_embed, neg_pooled_prompt_embed = compute_text_embeddings([""], text_encoders, tokenizers, max_sequence_length=128, device=accelerator.device)
-
-    sample_neg_prompt_embeds = neg_prompt_embed.repeat(config.sample.train_batch_size, 1, 1)
-    train_neg_prompt_embeds = neg_prompt_embed.repeat(config.train.batch_size, 1, 1)
-    sample_neg_pooled_prompt_embeds = neg_pooled_prompt_embed.repeat(config.sample.train_batch_size, 1)
-    train_neg_pooled_prompt_embeds = neg_pooled_prompt_embed.repeat(config.train.batch_size, 1)
-
     if config.sample.num_image_per_prompt == 1:
         config.per_prompt_stat_tracking = False
     # initialize stat tracker
@@ -605,37 +887,48 @@ def main(_):
 
     
 
-    # Prepare everything with our `accelerator`.
-    # 现在可以安全地把它们都放入 prepare，显存将被完美切分和释放
-    (
-        transformer, 
-        pipeline.text_encoder, 
-        pipeline.text_encoder_2, 
-        pipeline.text_encoder_3, 
-        optimizer, 
-        train_dataloader, 
-        test_dataloader
-    ) = accelerator.prepare(
-        transformer, 
-        pipeline.text_encoder, 
-        pipeline.text_encoder_2, 
-        pipeline.text_encoder_3, 
-        optimizer, 
-        train_dataloader, 
-        test_dataloader
-    )
+    if use_fsdp2:
+        # reduce memory: FSDP2 模型已手动 fully_shard，这里只 prepare optimizer/dataloader，避免二次包裹。
+        optimizer, train_dataloader, test_dataloader = accelerator.prepare(
+            optimizer,
+            train_dataloader,
+            test_dataloader,
+        )
+    else:
+        (
+            transformer,
+            pipeline.text_encoder,
+            pipeline.text_encoder_2,
+            pipeline.text_encoder_3,
+            optimizer,
+            train_dataloader,
+            test_dataloader,
+        ) = accelerator.prepare(
+            transformer,
+            pipeline.text_encoder,
+            pipeline.text_encoder_2,
+            pipeline.text_encoder_3,
+            optimizer,
+            train_dataloader,
+            test_dataloader,
+        )
 
     text_encoders = [pipeline.text_encoder, pipeline.text_encoder_2, pipeline.text_encoder_3]
 
     transformer_trainable_parameters = list(filter(lambda p: p.requires_grad, transformer.parameters()))
 
-    # 5. 💡 此时再初始化 EMA！它克隆到的就是完美匹配 FSDP 的切碎形状
-    ema = EMAModuleWrapper(
-        transformer_trainable_parameters, 
-        decay=0.9, 
-        update_step_interval=8, 
-        device=accelerator.device
+    neg_prompt_embed, neg_pooled_prompt_embed = compute_text_embeddings(
+        [""],
+        text_encoders,
+        tokenizers,
+        max_sequence_length=128,
+        device=accelerator.device,
     )
+
+    sample_neg_prompt_embeds = neg_prompt_embed.repeat(config.sample.train_batch_size, 1, 1)
+    train_neg_prompt_embeds = neg_prompt_embed.repeat(config.train.batch_size, 1, 1)
+    sample_neg_pooled_prompt_embeds = neg_pooled_prompt_embed.repeat(config.sample.train_batch_size, 1)
+    train_neg_pooled_prompt_embeds = neg_pooled_prompt_embed.repeat(config.train.batch_size, 1)
 
     # executor to perform callbacks asynchronously. this is beneficial for the llava callbacks which makes a request to a
     # remote server running llava inference.
@@ -675,13 +968,15 @@ def main(_):
     epoch = 0
     global_step = 0
     train_iter = iter(train_dataloader)
+    # reduce memory: 控制采样得到的 prompt embedding、latent、log_prob 是否放到 CPU replay buffer。
+    sample_cpu_offload = bool(getattr(config, "sample_cpu_offload", False))
 
-    while True:
+    while epoch < config.num_epochs:
         #################### EVAL ####################
         pipeline.transformer.eval()
-        if epoch % config.eval_freq == 0:
+        if config.eval_freq > 0 and epoch % config.eval_freq == 0:
             eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, eval_reward_fn, executor, autocast, num_train_timesteps, ema, transformer_trainable_parameters)
-        if epoch % config.save_freq == 0 and epoch > 0 and accelerator.is_main_process:
+        if config.save_freq > 0 and epoch % config.save_freq == 0 and epoch > 0:
             save_ckpt(config.save_dir, transformer, global_step, accelerator, ema, transformer_trainable_parameters, config)
 
         #################### SAMPLING ####################
@@ -731,7 +1026,11 @@ def main(_):
                         height=config.resolution,
                         width=config.resolution, 
                         noise_level=config.sample.noise_level,
-                        generator=generator
+                        generator=generator,
+                        # reduce memory: 采样 CFG 拆成两次前向，避免每个 denoise step 临时双倍 batch。
+                        sequential_guidance=bool(
+                            getattr(config.sample, "cfg_sequential", getattr(config.train, "cfg_sequential", False))
+                        ),
                 )
 
             latents = torch.stack(
@@ -742,28 +1041,36 @@ def main(_):
             timesteps = pipeline.scheduler.timesteps.repeat(
                 config.sample.train_batch_size, 1
             )  # (batch_size, num_steps)
+            # reduce memory: reward 计算只需要图像内容，先把图像转 CPU，释放采样阶段 GPU 占用。
+            images_for_reward = images.detach().cpu() if sample_cpu_offload else images
 
             # compute rewards asynchronously
-            rewards = executor.submit(reward_fn, images, prompts, prompt_metadata, only_strict=True)
+            rewards = executor.submit(reward_fn, images_for_reward, prompts, prompt_metadata, only_strict=True)
             # yield to to make sure reward computation starts
             time.sleep(0)
 
             samples.append(
                 {
-                    "prompt_ids": prompt_ids,
-                    "prompt_embeds": prompt_embeds,
-                    "pooled_prompt_embeds": pooled_prompt_embeds,
-                    "timesteps": timesteps,
-                    "latents": latents[
-                        :, :-1
-                    ],  # each entry is the latent before timestep t
-                    "next_latents": latents[
-                        :, 1:
-                    ],  # each entry is the latent after timestep t
-                    "log_probs": log_probs,
+                    # reduce memory: replay buffer 中的大张量放 CPU，避免采样后整条轨迹常驻 GPU。
+                    "prompt_ids": maybe_tensor_to_cpu(prompt_ids, sample_cpu_offload),
+                    "prompt_embeds": maybe_tensor_to_cpu(prompt_embeds, sample_cpu_offload),
+                    "pooled_prompt_embeds": maybe_tensor_to_cpu(pooled_prompt_embeds, sample_cpu_offload),
+                    "timesteps": maybe_tensor_to_cpu(timesteps, sample_cpu_offload),
+                    "latents": maybe_tensor_to_cpu(
+                        latents[:, :-1], sample_cpu_offload
+                    ),  # each entry is the latent before timestep t
+                    "next_latents": maybe_tensor_to_cpu(
+                        latents[:, 1:], sample_cpu_offload
+                    ),  # each entry is the latent after timestep t
+                    "log_probs": maybe_tensor_to_cpu(log_probs, sample_cpu_offload),
                     "rewards": rewards,
                 }
             )
+            if sample_cpu_offload:
+                # reduce memory: 采样结果已转 CPU 后，立即删除 GPU 临时变量并清 cache。
+                images = images_for_reward
+                del latents, log_probs, timesteps, prompt_embeds, pooled_prompt_embeds, prompt_ids
+                empty_cuda_cache_if_needed(True)
 
         # wait for all rewards to be computed
         for sample in tqdm(
@@ -838,7 +1145,10 @@ def main(_):
         # per-prompt mean/std tracking
         if config.per_prompt_stat_tracking:
             # gather the prompts across processes
-            prompt_ids = accelerator.gather(samples["prompt_ids"]).cpu().numpy()
+            # reduce memory: 只在跨卡 gather prompt id 时临时搬回 GPU，随后立即释放。
+            prompt_ids_for_gather = samples["prompt_ids"].to(accelerator.device, non_blocking=True)
+            prompt_ids = accelerator.gather(prompt_ids_for_gather).cpu().numpy()
+            del prompt_ids_for_gather
             prompts = pipeline.tokenizer.batch_decode(
                 prompt_ids, skip_special_tokens=True
             )
@@ -867,10 +1177,9 @@ def main(_):
 
         # ungather advantages; we only need to keep the entries corresponding to the samples on this process
         advantages = torch.as_tensor(advantages)
-        samples["advantages"] = (
-            advantages.reshape(accelerator.num_processes, -1, advantages.shape[-1])[accelerator.process_index]
-            .to(accelerator.device)
-        )
+        local_advantages = advantages.reshape(accelerator.num_processes, -1, advantages.shape[-1])[accelerator.process_index]
+        # reduce memory: advantages 跟随 replay buffer 放 CPU，训练当前 batch 时再搬回 GPU。
+        samples["advantages"] = local_advantages.cpu() if sample_cpu_offload else local_advantages.to(accelerator.device)
         if accelerator.is_local_main_process:
             print("advantages: ", samples["advantages"].abs().mean())
 
@@ -898,7 +1207,8 @@ def main(_):
                 step=global_step,
             )
         # Filter out samples where the entire time dimension of advantages is zero
-        samples = {k: v[mask] for k, v in samples.items()}
+        # reduce memory: CPU replay buffer 在 CPU 上完成 mask 筛选，避免整批迁回 GPU。
+        samples = {k: index_tensor(v, mask) for k, v in samples.items()}
 
         total_batch_size, num_timesteps = samples["timesteps"].shape
         # assert (
@@ -910,7 +1220,7 @@ def main(_):
         #################### TRAINING ####################
         for inner_epoch in range(config.train.num_inner_epochs):
             # shuffle samples along batch dimension
-            perm = torch.randperm(total_batch_size, device=accelerator.device)
+            perm = torch.randperm(total_batch_size, device=samples["timesteps"].device)
             samples = {k: v[perm] for k, v in samples.items()}
 
             # rebatch for training
@@ -933,17 +1243,31 @@ def main(_):
                 position=0,
                 disable=not accelerator.is_local_main_process,
             ):
+                if sample_cpu_offload:
+                    # reduce memory: 只把当前训练 micro-batch 搬到 GPU，不让全 epoch 样本常驻显存。
+                    sample = tensor_tree_to_device(sample, accelerator.device)
                 if config.train.cfg:
-                    # concat negative prompts to sample prompts to avoid two forward passes
-                    embeds = torch.cat(
-                        [train_neg_prompt_embeds[:len(sample["prompt_embeds"])], sample["prompt_embeds"]]
-                    )
-                    pooled_embeds = torch.cat(
-                        [train_neg_pooled_prompt_embeds[:len(sample["pooled_prompt_embeds"])], sample["pooled_prompt_embeds"]]
-                    )
+                    if bool(getattr(config.train, "cfg_sequential", False)):
+                        # reduce memory: sequential CFG 下不拼接 negative/positive embedding，避免双 batch 激活。
+                        embeds = sample["prompt_embeds"]
+                        pooled_embeds = sample["pooled_prompt_embeds"]
+                        negative_embeds = train_neg_prompt_embeds[:len(sample["prompt_embeds"])]
+                        negative_pooled_embeds = train_neg_pooled_prompt_embeds[:len(sample["pooled_prompt_embeds"])]
+                    else:
+                        # concat negative prompts to sample prompts to avoid two forward passes
+                        embeds = torch.cat(
+                            [train_neg_prompt_embeds[:len(sample["prompt_embeds"])], sample["prompt_embeds"]]
+                        )
+                        pooled_embeds = torch.cat(
+                            [train_neg_pooled_prompt_embeds[:len(sample["pooled_prompt_embeds"])], sample["pooled_prompt_embeds"]]
+                        )
+                        negative_embeds = None
+                        negative_pooled_embeds = None
                 else:
                     embeds = sample["prompt_embeds"]
                     pooled_embeds = sample["pooled_prompt_embeds"]
+                    negative_embeds = None
+                    negative_pooled_embeds = None
 
                 train_timesteps = [step_index  for step_index in range(num_train_timesteps)]
                 for j in tqdm(
@@ -953,13 +1277,33 @@ def main(_):
                     leave=False,
                     disable=not accelerator.is_local_main_process,
                 ):
-                    with accelerator.accumulate(transformer):
+                    with fsdp2_accumulate(accelerator, transformer, use_fsdp2):
                         with autocast():
-                            prev_sample, log_prob, prev_sample_mean, std_dev_t = compute_log_prob(transformer, pipeline, sample, j, embeds, pooled_embeds, config)
+                            prev_sample, log_prob, prev_sample_mean, std_dev_t = compute_log_prob(
+                                transformer,
+                                pipeline,
+                                sample,
+                                j,
+                                embeds,
+                                pooled_embeds,
+                                config,
+                                negative_embeds,
+                                negative_pooled_embeds,
+                            )
                             if config.train.beta > 0:
                                 with torch.no_grad():
-                                    with transformer.module.disable_adapter():
-                                        _, _, prev_sample_mean_ref, _ = compute_log_prob(transformer, pipeline, sample, j, embeds, pooled_embeds, config)
+                                    with disable_adapter(transformer):
+                                        _, _, prev_sample_mean_ref, _ = compute_log_prob(
+                                            transformer,
+                                            pipeline,
+                                            sample,
+                                            j,
+                                            embeds,
+                                            pooled_embeds,
+                                            config,
+                                            negative_embeds,
+                                            negative_pooled_embeds,
+                                        )
 
                         # grpo logic
                         advantages = torch.clamp(
@@ -1016,9 +1360,13 @@ def main(_):
                         # backward pass
                         accelerator.backward(loss)
                         if accelerator.sync_gradients:
-                            accelerator.clip_grad_norm_(
-                                transformer.parameters(), config.train.max_grad_norm
-                            )
+                            if use_fsdp2:
+                                accelerator.unscale_gradients(optimizer)
+                                fsdp2_clip_grad_norm_(transformer.parameters(), config.train.max_grad_norm)
+                            else:
+                                accelerator.clip_grad_norm_(
+                                    transformer.parameters(), config.train.max_grad_norm
+                                )
                         optimizer.step()
                         optimizer.zero_grad()
 
@@ -1044,4 +1392,3 @@ def main(_):
         
 if __name__ == "__main__":
     app.run(main)
-

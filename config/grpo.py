@@ -429,6 +429,16 @@ def pickscore_sd3_4gpu():
     config.sample.global_std = True
     config.sample.same_latent = False
     config.train.ema = True
+    # reduce memory: 24GB 显卡使用 FSDP2、重计算、CPU offload 和 sequential CFG 压低峰值显存，不改 batch size。
+    config.mixed_precision = "bf16"
+    config.activation_checkpointing = True
+    config.fsdp2 = True
+    config.fsdp2_shard_text_encoders = True
+    config.fsdp2_cpu_offload = True
+    config.fsdp_optimizer_offload = True
+    config.sample_cpu_offload = True
+    config.sample.cfg_sequential = True
+    config.train.cfg_sequential = True
     config.save_freq = 60 # epoch
     config.eval_freq = 60
     config.save_dir = 'logs/pickscore/sd3.5-M'
